@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 
-# Author:       Benjamin Valpey
-# Date:         21 Feb 2023
-# Filename:     fp_add.py
-# Last Edited:  Wed 07 Jun 2023 03:58:28 PM EDT
-# Description:
+# SPDX-FileCopyrightText: 2023-2024 University of Rochester
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+__author__ = "Benjamin Valpey"
+__license__ = "LGPL-3.0-or-later"
 
 from typing import List, Optional, Tuple
 from cvc5.pythonic import *
@@ -95,7 +96,7 @@ def fp_add_two_dropshift(a: Term, bval, num_extra_bits):
         And(a.mantissa == 0, b.mantissa == 0),
         a.sign | b.sign,
         If(
-            And(a.mantissa == shifted_b, Not(is_add)),
+            And(a.mantissa == shifted_b),
             BitVecVal(1, 1),
             If(a.mantissa > shifted_b, a.sign, b.sign),
         ),

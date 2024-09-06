@@ -1,15 +1,13 @@
 #!/usr/bin/env python
 
-# Author:       Benjamin Valpey
-# Date:         21 Mar 2023
-# Filename:     markidi.py
-# Last Edited:  Fri 28 Apr 2023 03:01:21 PM EDT
-# Description:  Implementation of Markidi's algorithm using the Volta TC semantics.
+# SPDX-FileCopyrightText: 2023-2024 University of Rochester
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
 
-# We are computing the maximal error after just one step of markidi
+__author__ = "Benjamin Valpey"
+__license__ = "LGPL-3.0-or-later"
 
 from cvc5.pythonic import *
-import functools
 from fp_add import fp_add
 import time
 
