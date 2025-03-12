@@ -8,9 +8,9 @@ __author__ = "Benjamin Valpey"
 __license__ = "LGPL-3.0-or-later"
 
 from typing import List, Optional, Tuple
-from cvc5.pythonic import *
+# from cvc5.pythonic import *
 
-# from z3 import *
+from z3 import *
 
 import functools
 import itertools
@@ -28,6 +28,15 @@ FpClass = FpClass.create()
 NaN = BitVecVal(0x7FC00000, 32)
 
 DEBUGPRINT = False
+
+
+def resetAssertions(func):
+    def wrapper(s, *args, **kwargs):
+        if getattr(s, "resetAssertions", None) is not None:
+            s.resetAssertions()
+        res = func(s, *args, **kwargs)
+
+    return wrapper
 
 
 def fpClassify(a: BitVecRef):
@@ -69,9 +78,11 @@ def dprint(*args):
         print(*args)
 
 
-def fp_add_two_dropshift(a: Term, bval, num_extra_bits):
+# This is the algorithm used by NVIDIA Tensor Cores
+# Any shifted bits are lost
+def fp_add_two_truncate_shift(a: Term, bval, num_extra_bits):
     """
-    Drops the significand when results are shifted.
+    Drops the significand when results are shifted. 
     This means that result is not correctly rounded with RTZ.
     If it was, then subtracting any nonzero number from a number would reduce (increase) the exponent
     E.g. in RTZ, subtracting 2^-24 from 2 would set exponent to 2^1 and have every bit in the significand set.
@@ -96,7 +107,8 @@ def fp_add_two_dropshift(a: Term, bval, num_extra_bits):
         And(a.mantissa == 0, b.mantissa == 0),
         a.sign | b.sign,
         If(
-            And(a.mantissa == shifted_b),
+            # Adding the same mantissa results in a negative result.
+            And(a.mantissa == shifted_b, Not(is_add)),
             BitVecVal(1, 1),
             If(a.mantissa > shifted_b, a.sign, b.sign),
         ),
@@ -201,7 +213,8 @@ def fp_add(nterms: int, num_extra_bits: int, terms: Optional[List] = None):
     else:
         # ensure all of the terms are bitvectors of size 32.
         # also ensure we have the proper number of terms
-        assert len(terms) == nterms and all(map(lambda x: isinstance(x, BitVecRef) and x.size() == 32, terms))
+        assert len(terms) == nterms, "Incorrect number of terms"
+        assert all(map(lambda x: isinstance(x, BitVecRef) and x.size() == 32, terms)), "Incorrect type of terms"
         make_terms = False
 
     for i in range(nterms):
@@ -239,7 +252,7 @@ def fp_add(nterms: int, num_extra_bits: int, terms: Optional[List] = None):
     accumulated = Term(maxVal, num_extra_bits)
     for pos, t in enumerate(terms):
         # dprint("Accumulated [before] is: ", accumulated)
-        acc_mantissa, acc_sign = fp_add_two_dropshift(
+        acc_mantissa, acc_sign = fp_add_two_truncate_shift(
             accumulated,
             If(
                 maxIndex == BitVecVal(pos, 32),
@@ -439,6 +452,7 @@ def check_accuracy():
     test_case.check_sat()
 
 
+@resetAssertions
 def prove_exact_addition(s: Solver):
     terms = []
     a = FreshConst(Float16())
@@ -492,6 +506,7 @@ def prove_exact_addition(s: Solver):
         print("Solver responded with unknown:", s.reason_unknown())
 
 
+@resetAssertions
 def check_mul_in_fp16(s: Solver):
     print("[Exact Product]")
     a = Const("a", Float16())
@@ -518,6 +533,7 @@ def check_mul_in_fp16(s: Solver):
     # produce numbers that, if the product was computed in fp16 would not be correct if done in fp32
 
 
+@resetAssertions
 def check_rounding_accumulator_abcd(s: Solver):
     a = Const("a", Float16())
     b = Const("b", Float16())
@@ -575,6 +591,7 @@ def check_rounding_accumulator_abcd(s: Solver):
     print("Query time: ", total_time / total_queries, "s", sep="")
 
 
+@resetAssertions
 def check_rounding_of_final_f16(s: Solver):
     a = FreshConst(Float16())
     b = FreshConst(Float16())
@@ -613,6 +630,7 @@ def check_rounding_of_final_f16(s: Solver):
     print("Query time: ", total_time / total_queries, "s", sep="")
 
 
+@resetAssertions
 def check_rounding_of_accumulator_abc(s: Solver):
     c = FreshConst(Float16())
     a = FreshConst(Float16())
@@ -712,6 +730,7 @@ def check_rounding_of_accumulator_abc(s: Solver):
     print("Query time:", total_time / total_queries)
 
 
+@resetAssertions
 def check_exact_in_fp16(s: Solver):
     """
     Determines inputs that test if the accumulation step of TCs uses exact addition or not,
@@ -755,6 +774,7 @@ def check_exact_in_fp16(s: Solver):
         print("Solver reported unknown:", s.reason_unknown())
 
 
+@resetAssertions
 def check_accumulation_order(s: Solver):
     """
     Checks the accumulation order used by tensor cores.
@@ -822,6 +842,7 @@ def check_accumulation_order(s: Solver):
     else:
         print("Solver returned unknown:", s.reason_unknown())
 
+@resetAssertions
 def check_normalization(s: Solver):
     a1 = FreshConst(Float16())
     a2 = FreshConst(Float16())
@@ -897,24 +918,27 @@ def check_normalization(s: Solver):
         print("Solver returned unknown:", s.reason_unknown())
 
 
-
-
-
-def check_carry_bits(s: Solver):
+@resetAssertions
+def check_carry_bits(s: Solver, n: int, nbits: int):
     """
-    Checks the amount of carry bits used by tensor cores. Assumes no normalization
+    Checks the amount of carry bits used by tensor cores. Assumes no normalization.
+    
+    :param s: The solver to use.
+    :param n: The number of terms to be accumulated.
+    :param nbits: The number of carry out bits to test against. (Checks `nbits` and `nbits-1`)
     """
     terms = []
-    for i in range(5):
+    for i in range(n):
         terms.append(Const(chr(97 + i), BitVecSort(32)))
 
     a_inputs = []
     b_inputs = []
-    for i in range(4):
+    for i in range(n):
         a = FreshConst(Float16())
         b = FreshConst(Float16())
         a_inputs.append(a)
         b_inputs.append(b)
+        # NaNs and Infs poision our result, since they never compare equal.
         s.add(fpIsPositive(a))
         s.add(fpIsPositive(b))
         s.add(And(Not(fpIsNaN(a)), Not(fpIsInf(a)), Not(fpIsZero(a))))
@@ -929,12 +953,12 @@ def check_carry_bits(s: Solver):
 
     # we have our assertions on the inputs to
 
-    res_2_bits = fp_add(5, 2, terms)
+    res_insufficient_bits = fp_add(n, nbits-1, terms)
     # need inputs which is exact in fp16, but for which you need extra bits
-    res_3_bits = fp_add(5, 3, terms)
+    res = fp_add(n, nbits, terms)
 
     start = time.time()
-    result = s.check(res_2_bits != res_3_bits)
+    result = s.check(res_insufficient_bits != res)
     end = time.time()
 
     print("Query time: ", end - start, "s", sep="")
@@ -945,16 +969,16 @@ def check_carry_bits(s: Solver):
                 f"a_{i} = {m.eval(a_inputs[i])}".ljust(30),
                 f"b_{i} = {m.eval(b_inputs[i])}",
             )
-        print(f"c = {m.eval(c)}")
-        print("res_2_bits is:", m.eval(fpBVToFP(res_2_bits, Float32())))
-        print("res_3_bits is:", m.eval(fpBVToFP(res_3_bits, Float32())))
+        c = m.eval(c)
+        print(f"c = {c}")
     elif result == unsat:
-        print("No values yield different results between 2 and 3 bits of carry.")
+        print(f"No values yield different results between {b} and {b-1} bits of carry.")
     else:
         # result is unknown
         print("Solver reported unknown:", s.reason_unknown())
 
 
+@resetAssertions
 def negative_zero_result(s: Solver):
     a = FreshConst(Float16())
     b = FreshConst(Float16())
@@ -963,7 +987,10 @@ def negative_zero_result(s: Solver):
     s.add(Not(fpIsZero(b)))
     s.add(fpIsZero(fpToFP(RNE(), res, Float16())))
     s.add(fpIsNegative(fpToFP(RNE(), res, Float16())))
-    response = s.check()
+    start = time.time()
+    result = s.check()
+    end = time.time()
+    print("Query time: ", end - start, "s", sep="")
     if response == sat:
         m = s.model()
         print("a", m.eval(a))
@@ -974,7 +1001,113 @@ def negative_zero_result(s: Solver):
         print("Solver reported unknown:", s.reason_unknown())
 
 
-if __name__ == "__main__":
+@resetAssertions
+def prove_subnormal_fp16_inputs(s: Solver):
+    a = FreshConst(Float16())
+    b = FreshConst(Float16())
+    res = fpMul(RTZ(), fpToFP(RTZ(), a, Float32()), fpToFP(RTZ(), b, Float32()))
+    s.add(fpIsSubnormal(a))
+    s.add(fpIsSubnormal(b))
+    s.add(Not(fpIsSubnormal(res)))
+    start = time.time()
+    response = s.check()
+    end = time.time()
+
+    print("Query time: ", end - start, "s", sep="")
+    if response == sat:
+        m = s.model()
+        print("a", m.eval(a))
+        print("b", m.eval(b))
+        print("expected result: ", m.eval(res))
+    elif response == unsat:
+        print("Unsat:")
+    else:
+        print("Solver reported unknown:", s.reason_unknown())
+
+@resetAssertions
+def prove_subnormal_fp16_outputs(s: Solver):
+    a = FreshConst(Float16())
+    b = FreshConst(Float16())
+    s.add(fpIsNormal(a))
+    s.add(fpIsNormal(b))
+    # If desired, make this rounding-mode agnostic by changing RTN() like in the mul tests
+    res = fpToFP(RTN(), fpMul(RTZ(), fpToFP(RTZ(), a, Float32()), fpToFP(RTZ(), b, Float32())), Float16())
+    s.add(fpIsSubnormal(res))
+    
+    start = time.time()
+    response = s.check()
+    end = time.time()
+
+    print("Query time: ", end - start, "s", sep="")
+    if response == sat:
+        m = s.model()
+        print("a", m.eval(a))
+        print("b", m.eval(b))
+        print("expected result: ", m.eval(res))
+    elif response == unsat:
+        print("Unsat:")
+    else:
+        print("Solver reported unknown:", s.reason_unknown())
+
+@resetAssertions
+def prove_subnormal_fp32_inputs(s: Solver):
+    a = FreshConst(Float16())
+    b = FreshConst(Float16())
+    s.add(fpIsNormal(a))
+    s.add(fpIsNormal(b))
+    c = FreshConst(Float32())
+    s.add(fpIsSubnormal(c))
+    ab = fpMul(RTZ(), fpToFP(RTZ(), a, Float32()), fpToFP(RTZ(), b, Float32()))
+    res = fpAdd(RTZ(), ab, c)
+    s.add(fpIsNormal(res))
+
+
+    start = time.time()
+    response = s.check()
+    end = time.time()
+
+    print("Query time: ", end - start, "s", sep="")
+    if response == sat:
+        m = s.model()
+        print("a", m.eval(a))
+        print("b", m.eval(b))
+        print("expected result: ", m.eval(res))
+    elif response == unsat:
+        print("Unsat:")
+    else:
+        print("Solver reported unknown:", s.reason_unknown())
+
+
+@resetAssertions
+def prove_subnormal_fp32_outputs(s: Solver):
+    a = FreshConst(Float16())
+    b = FreshConst(Float16())
+    s.add(fpIsNormal(a))
+    s.add(fpIsNormal(b))
+    c = FreshConst(Float32())
+    s.add(fpIsNormal(c))
+    ab = fpMul(RTZ(), fpToFP(RTZ(), a, Float32()), fpToFP(RTZ(), b, Float32()))
+    fp32_res = fpAdd(RTZ(), ab, c)
+    s.add(fpIsSubnormal(fp32_res))
+
+    start = time.time()
+    response = s.check()
+    end = time.time()
+
+    print("Query time: ", end - start, "s", sep="")
+    if response == sat:
+        m = s.model()
+        print("a", m.eval(a))
+        print("b", m.eval(b))
+        print("c", m.eval(c))
+        print("expected result: ", m.eval(fp32_res))
+    elif response == unsat:
+        # impossible to have normal inputs that have subnormal output
+        print("Unsat:")
+    else:
+        print("Solver reported unknown:", s.reason_unknown())
+
+def main():
     s = Solver()
 
     if getattr(s, "setOption", None) is not None:
@@ -989,29 +1122,25 @@ if __name__ == "__main__":
 
     # check_accuracy()
     # check_accumulation_order(s)
-    if getattr(s, "resetAssertions", None) is not None:
-        s.resetAssertions()
-    # check_rounding_of_accumulator_abc(s)
-    if getattr(s, "resetAssertions", None) is not None:
-        s.resetAssertions()
-    # check_carry_bits(s)
-    if getattr(s, "resetAssertions", None) is not None:
-        s.resetAssertions()
+
+    # check_carry_bits(s, 5, 3)
+    # check_carry_bits(s, 9, 2)
     # check_rounding_of_final_f16(s)
-    if getattr(s, "resetAssertions", None) is not None:
-        s.resetAssertions()
     # check_mul_in_fp16(s)
-    if getattr(s, "resetAssertions", None) is not None:
-        s.resetAssertions()
-    check_exact_in_fp16(s)
-    if getattr(s, "resetAssertions", None) is not None:
-        s.resetAssertions()
+    # check_exact_in_fp16(s)
     # check_normalization(s)
-    if getattr(s, "resetAssertions", None) is not None:
-        s.resetAssertions()
+
+    prove_subnormal_fp16_inputs(s)
+    # prove_subnormal_fp16_outputs(s)
+    # prove_subnormal_fp32_inputs(s)
+    # prove_subnormal_fp32_outputs(s)
 
     # without normalization, we need the precise amount of extra bits in order to have sensible results.
     # otherwise, you can do things like adding a bunch of 1s together and get an incorrect result.
-    # The amount of extra bits needed is at most log2(terms), although this is possibly too many, since
     # adding 4 1s and a -1 gives 3
     # print(is_sat(fp_add(5, 2, terms) == BitVecVal(0x40400000, 32)))
+
+
+if __name__ == "__main__":
+    main()
+
